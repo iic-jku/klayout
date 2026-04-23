@@ -158,6 +158,7 @@ LayoutCanvas::LayoutCanvas (lay::LayoutViewBase *view)
     m_redraw_force_update (true),
     m_update_image (true),
     m_drawing_finished (false),
+    m_last_fg_trans_valid (false),
     m_do_update_image_dm (this, &LayoutCanvas::do_update_image),
     m_do_end_of_drawing_dm (this, &LayoutCanvas::do_end_of_drawing),
     m_image_cache_size (1)
@@ -533,9 +534,59 @@ LayoutCanvas::free_resources ()
     delete mp_image_fg;
     mp_image_fg = 0;
   }
+  m_last_fg_trans_valid = false;
 }
 
 #if defined(HAVE_QT)
+
+//  Shift the content of a PixelBuffer in-place by (dx, dy) screen pixels.
+//  Positive dx: content shifts RIGHT (left strip filled with bg).
+//  Positive dy: content shifts DOWN  (top  strip filled with bg).
+//  scan_line(0) is the top of the image in screen coordinates.
+static void
+shift_pixel_buffer (tl::PixelBuffer &pb, int dx, int dy, tl::color_t bg)
+{
+  int w = (int) pb.width ();
+  int h = (int) pb.height ();
+
+  if (std::abs (dx) >= w || std::abs (dy) >= h) {
+    pb.fill (bg);
+    return;
+  }
+
+  //  vertical shift first (no extra buffer needed: rows are independent)
+  if (dy > 0) {
+    for (int y = h - 1; y >= dy; --y) {
+      memcpy (pb.scan_line (y), pb.scan_line (y - dy), (size_t) w * sizeof (tl::color_t));
+    }
+    for (int y = 0; y < dy; ++y) {
+      std::fill (pb.scan_line (y), pb.scan_line (y) + w, bg);
+    }
+  } else if (dy < 0) {
+    for (int y = 0; y < h + dy; ++y) {
+      memcpy (pb.scan_line (y), pb.scan_line (y - dy), (size_t) w * sizeof (tl::color_t));
+    }
+    for (int y = h + dy; y < h; ++y) {
+      std::fill (pb.scan_line (y), pb.scan_line (y) + w, bg);
+    }
+  }
+
+  //  horizontal shift (done row-by-row using memmove for potential overlap)
+  if (dx > 0) {
+    for (int y = 0; y < h; ++y) {
+      tl::color_t *sl = pb.scan_line (y);
+      memmove (sl + dx, sl, (size_t) (w - dx) * sizeof (tl::color_t));
+      std::fill (sl, sl + dx, bg);
+    }
+  } else if (dx < 0) {
+    for (int y = 0; y < h; ++y) {
+      tl::color_t *sl = pb.scan_line (y);
+      memmove (sl, sl - dx, (size_t) (w + dx) * sizeof (tl::color_t));
+      std::fill (sl + w + dx, sl + w, bg);
+    }
+  }
+}
+
 void
 LayoutCanvas::paint_event ()
 {
@@ -567,12 +618,64 @@ LayoutCanvas::paint_event ()
         *mp_image = *mp_image_bg;
       }
 
-      //  render the main bitmaps
-      to_image (scaled_view_ops (1.0 / resolution ()), dither_pattern (), line_styles (), 1.0 / resolution (), background_color (), foreground_color (), active_color (), this, *mp_image, m_viewport_l.width (), m_viewport_l.height ());
+      //  Pan shortcut: when the viewport has moved by a pure translation (no zoom/rotation)
+      //  and a correctly-built mp_image_fg is already available, shift it directly rather
+      //  than re-compositing all layer bitmaps via to_image() + subsample.
+      //
+      //  Sign convention (mp_image has scan_line(0) at the top of the screen, while the
+      //  layer bitmaps use math-y so bitmaps_to_image writes bitmap row y to scan_line(H-1-y)):
+      //    image_shift_x =  Δdisp_l.x
+      //    image_shift_y = -Δdisp_l.y
+      //  For mp_image_fg (screen resolution) the shift is divided by m_oversampling.
+      bool used_pan_shortcut = false;
+      if (m_last_fg_trans_valid &&
+          mp_image_fg != nullptr &&
+          mp_image_fg->width () > 0 && mp_image_fg->height () > 0 &&
+          ! needs_update_static ()) {
 
-      if (mp_image_fg) {
-        delete mp_image_fg;
-        mp_image_fg = 0;
+        const db::DCplxTrans &old_t = m_last_fg_trans_l;
+        const db::DCplxTrans &new_t = m_viewport_l.trans ();
+
+        //  Only apply the shortcut for a pure translation (same scale, angle and mirror).
+        if (old_t.mag () > 0.0 &&
+            fabs (old_t.mag () - new_t.mag ()) < 1e-6 * old_t.mag () &&
+            fabs (old_t.angle () - new_t.angle ()) < 1e-4 &&
+            old_t.is_mirror () == new_t.is_mirror ()) {
+
+          db::DVector dd = new_t.disp () - old_t.disp ();
+          int sv_x = (int) round (dd.x ());   //  shift in oversampled pixels
+          int sv_y = (int) round (dd.y ());
+
+          if (sv_x != 0 || sv_y != 0) {
+
+            //  Shift the screen-resolution cached image.  The oversampled mp_image only
+            //  contains the background at this point and is not shifted (it is not used
+            //  when the pan shortcut is active; it will be correctly reset from mp_image_bg
+            //  the next time to_image() runs).
+            int dx_fg = sv_x / (int) m_oversampling;
+            int dy_fg = -sv_y / (int) m_oversampling;
+            shift_pixel_buffer (*mp_image_fg, dx_fg, dy_fg, m_background);
+
+            //  Record the updated viewport so the next frame computes its incremental delta.
+            m_last_fg_trans_l = new_t;
+            used_pan_shortcut = true;
+
+          }
+
+        }
+
+      }
+
+      if (! used_pan_shortcut) {
+
+        //  render the main bitmaps
+        to_image (scaled_view_ops (1.0 / resolution ()), dither_pattern (), line_styles (), 1.0 / resolution (), background_color (), foreground_color (), active_color (), this, *mp_image, m_viewport_l.width (), m_viewport_l.height ());
+
+        if (mp_image_fg) {
+          delete mp_image_fg;
+          mp_image_fg = 0;
+        }
+
       }
 
       m_update_image = false;
@@ -622,6 +725,11 @@ LayoutCanvas::paint_event ()
         *mp_image_fg = subsampled_image;
 
       }
+
+      //  Record the viewport at which mp_image_fg was built so the pan shortcut can compute
+      //  the correct pixel delta on subsequent frames.
+      m_last_fg_trans_l = m_viewport_l.trans ();
+      m_last_fg_trans_valid = true;
 
     }
 
@@ -1074,6 +1182,7 @@ LayoutCanvas::do_redraw_all (bool force_redraw)
   m_redraw_clearing = true;
   if (force_redraw) {
     m_redraw_force_update = true;
+    m_last_fg_trans_valid = false;   //  force full mp_image_fg rebuild after zoom/resize/layer-change
   }
 
   //  redraw the background elements
