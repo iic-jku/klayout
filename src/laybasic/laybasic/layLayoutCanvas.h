@@ -448,6 +448,7 @@ private:
   bool m_update_image;
   bool m_drawing_finished;
   db::DCplxTrans m_last_fg_trans_l;
+  db::DCplxTrans m_last_fg_trans;
   bool m_last_fg_trans_valid;
   std::vector<int> m_need_redraw_layer;
   std::vector<lay::RedrawLayerInfo> m_layers;

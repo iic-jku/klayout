@@ -622,42 +622,39 @@ LayoutCanvas::paint_event ()
       //  and a correctly-built mp_image_fg is already available, shift it directly rather
       //  than re-compositing all layer bitmaps via to_image() + subsample.
       //
-      //  Sign convention (mp_image has scan_line(0) at the top of the screen, while the
-      //  layer bitmaps use math-y so bitmaps_to_image writes bitmap row y to scan_line(H-1-y)):
-      //    image_shift_x =  Δdisp_l.x
-      //    image_shift_y = -Δdisp_l.y
-      //  For mp_image_fg (screen resolution) the shift is divided by m_oversampling.
+      //  We detect a pure translation from the oversampled viewport (m_viewport_l) which
+      //  has sub-pixel precision, and we compute the actual screen-pixel shift from
+      //  m_viewport.trans() whose disp() is always an integer (Viewport::set_box rounds
+      //  via floor(0.5+…)) — so there is no accumulated rounding drift.
       bool used_pan_shortcut = false;
       if (m_last_fg_trans_valid &&
-          mp_image_fg != nullptr &&
+          mp_image_fg &&
           mp_image_fg->width () > 0 && mp_image_fg->height () > 0 &&
           ! needs_update_static ()) {
 
-        const db::DCplxTrans &old_t = m_last_fg_trans_l;
-        const db::DCplxTrans &new_t = m_viewport_l.trans ();
+        const db::DCplxTrans &old_tl = m_last_fg_trans_l;
+        const db::DCplxTrans &new_tl = m_viewport_l.trans ();
 
         //  Only apply the shortcut for a pure translation (same scale, angle and mirror).
-        if (old_t.mag () > 0.0 &&
-            fabs (old_t.mag () - new_t.mag ()) < 1e-6 * old_t.mag () &&
-            fabs (old_t.angle () - new_t.angle ()) < 1e-4 &&
-            old_t.is_mirror () == new_t.is_mirror ()) {
+        if (old_tl.mag () > 1e-10 &&
+            fabs (old_tl.mag () - new_tl.mag ()) < 1e-6 * old_tl.mag () + 1e-12 &&
+            fabs (old_tl.angle () - new_tl.angle ()) < 1e-4 &&
+            old_tl.is_mirror () == new_tl.is_mirror ()) {
 
-          db::DVector dd = new_t.disp () - old_t.disp ();
-          int sv_x = (int) round (dd.x ());   //  shift in oversampled pixels
-          int sv_y = (int) round (dd.y ());
+          //  Compute the pixel shift from the screen-resolution viewport.
+          //  m_viewport.trans().disp() is always an integer (Viewport::set_box rounds),
+          //  so the shift is exact with no division and no accumulated error.
+          db::DVector dd = m_viewport.trans ().disp () - m_last_fg_trans.disp ();
+          int dx_fg = (int) round (dd.x ());
+          int dy_fg = (int) round (-dd.y ());
 
-          if (sv_x != 0 || sv_y != 0) {
+          if (dx_fg != 0 || dy_fg != 0) {
 
-            //  Shift the screen-resolution cached image.  The oversampled mp_image only
-            //  contains the background at this point and is not shifted (it is not used
-            //  when the pan shortcut is active; it will be correctly reset from mp_image_bg
-            //  the next time to_image() runs).
-            int dx_fg = sv_x / (int) m_oversampling;
-            int dy_fg = -sv_y / (int) m_oversampling;
             shift_pixel_buffer (*mp_image_fg, dx_fg, dy_fg, m_background);
 
-            //  Record the updated viewport so the next frame computes its incremental delta.
-            m_last_fg_trans_l = new_t;
+            //  Record the updated viewports so the next frame computes its incremental delta.
+            m_last_fg_trans_l = new_tl;
+            m_last_fg_trans   = m_viewport.trans ();
             used_pan_shortcut = true;
 
           }
@@ -729,6 +726,7 @@ LayoutCanvas::paint_event ()
       //  Record the viewport at which mp_image_fg was built so the pan shortcut can compute
       //  the correct pixel delta on subsequent frames.
       m_last_fg_trans_l = m_viewport_l.trans ();
+      m_last_fg_trans   = m_viewport.trans ();
       m_last_fg_trans_valid = true;
 
     }
